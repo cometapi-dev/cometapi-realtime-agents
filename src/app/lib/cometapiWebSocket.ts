@@ -37,6 +37,7 @@ export class CometAPIWebSocket {
   private audioQueue: string[] = [];
   private isPlaying: boolean = false;
   private audioPacketsSent: number = 0; // Track audio packets for debugging
+  private lastServerError: RealtimeEvent | null = null;
 
   private apiKey: string;
   private model: string;
@@ -56,14 +57,61 @@ export class CometAPIWebSocket {
     console.log(`ℹ️ ${message}`, ...args);
   }
 
+  private getConnectionContext() {
+    return {
+      model: this.model,
+      url: this.url,
+      readyState: this.ws?.readyState ?? WebSocket.CLOSED,
+      lastServerError: this.lastServerError,
+    };
+  }
+
+  private getServerErrorMessage(event: RealtimeEvent | null): string | null {
+    const error = event?.error;
+    if (!error) return null;
+    if (typeof error === "string") return error;
+    return error.message || error.code || error.type || null;
+  }
+
+  private createWebSocketErrorEvent(error: Event): RealtimeEvent {
+    const message =
+      this.getServerErrorMessage(this.lastServerError) ||
+      "WebSocket connection to CometAPI Realtime failed.";
+
+    return {
+      type: "error",
+      error: {
+        type: "websocket_error",
+        code: "websocket_error",
+        message,
+        browser_event_type: error.type,
+      },
+      ...this.getConnectionContext(),
+    };
+  }
+
   /**
    * Connect to CometAPI Realtime WebSocket
    */
   async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
+        let isSettled = false;
         const wsUrl = `${this.url}?model=${this.model}`;
+        this.lastServerError = null;
         console.log("[CometAPIWebSocket] Connecting to:", wsUrl);
+
+        const resolveOnce = () => {
+          if (isSettled) return;
+          isSettled = true;
+          resolve();
+        };
+
+        const rejectOnce = (message: string) => {
+          if (isSettled) return;
+          isSettled = true;
+          reject(new Error(message));
+        };
 
         // Create WebSocket with API key authentication via subprotocol
         this.ws = new WebSocket(wsUrl, [
@@ -78,7 +126,7 @@ export class CometAPIWebSocket {
           // Console doesn't await, doesn't have any delays - just starts immediately
           this.startAudioCaptureSync();
 
-          resolve();
+          resolveOnce();
         });
 
         this.ws.addEventListener("message", (event) => {
@@ -153,14 +201,29 @@ export class CometAPIWebSocket {
             "[CometAPIWebSocket] 📝 Check CometAPI dashboard for quota/auth issues: https://platform.cometapi.com"
           );
 
+          const closeEvent = {
+            type: "close",
+            code: event.code,
+            reason: event.reason,
+            wasClean: event.wasClean,
+            ...this.getConnectionContext(),
+          };
+
+          this.emit(closeEvent);
           this.cleanup();
-          this.emit({ type: "close", code: event.code, reason: event.reason });
+
+          if (!isSettled && event.code !== 1000) {
+            const serverError = this.getServerErrorMessage(this.lastServerError);
+            const reason = event.reason || serverError || "WebSocket closed before the session was ready.";
+            rejectOnce(`CometAPI Realtime closed (${event.code}): ${reason}`);
+          }
         });
 
         this.ws.addEventListener("error", (error) => {
-          console.error("[CometAPIWebSocket] WebSocket error:", error);
-          this.emit({ type: "error", error });
-          reject(error);
+          const errorEvent = this.createWebSocketErrorEvent(error);
+          console.error("[CometAPIWebSocket] WebSocket error:", errorEvent);
+          this.emit(errorEvent);
+          rejectOnce(errorEvent.error.message);
         });
       } catch (error) {
         console.error("[CometAPIWebSocket] Connection failed:", error);
@@ -182,6 +245,7 @@ export class CometAPIWebSocket {
 
     // Handle error events
     if (event.type === "error") {
+      this.lastServerError = event;
       console.warn("[CometAPIWebSocket] Server error event:", event);
     }
 

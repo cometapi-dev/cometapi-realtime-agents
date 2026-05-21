@@ -18,6 +18,7 @@ import type { RealtimeAgent } from '@openai/agents/realtime';
 import { useTranscript } from "@/app/contexts/TranscriptContext";
 import { useEvent } from "@/app/contexts/EventContext";
 import { useRealtimeSession } from "./hooks/useRealtimeSession";
+import { createRealtimeSessionUpdate } from "./lib/realtimeSessionConfig";
 import { createModerationGuardrail } from "@/app/agentConfigs/guardrails";
 
 // Agent configs
@@ -104,6 +105,7 @@ function App() {
 
   const [sessionStatus, setSessionStatus] =
     useState<SessionStatus>("DISCONNECTED");
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
   const [isEventsPaneExpanded, setIsEventsPaneExpanded] =
     useState<boolean>(true);
@@ -184,15 +186,38 @@ function App() {
   }, [isPTTActive]);
   */
 
+  const getConnectionErrorMessage = (data: any, status?: number) => {
+    const preflightMessage = data?.preflight?.message;
+    const preflightCode = data?.preflight?.code;
+    const serverMessage = data?.message || data?.error;
+    const prefix = status ? `Realtime preflight failed (${status})` : "Realtime connection failed";
+    const detail = preflightMessage || serverMessage || "No diagnostic message was returned.";
+    return preflightCode ? `${prefix}: ${detail} [${preflightCode}]` : `${prefix}: ${detail}`;
+  };
+
+  const getErrorMessage = (err: unknown) => {
+    return err instanceof Error ? err.message : String(err);
+  };
+
   const fetchEphemeralKey = async (): Promise<string | null> => {
     logClientEvent({ url: "/session" }, "fetch_session_token_request");
     const tokenResponse = await fetch("/api/session");
     const data = await tokenResponse.json();
     logServerEvent(data, "fetch_session_token_response");
 
+    if (!tokenResponse.ok) {
+      const message = getConnectionErrorMessage(data, tokenResponse.status);
+      setConnectionError(message);
+      logClientEvent({ type: "error", message, response: data }, "fetch_session_token_failed");
+      setSessionStatus("DISCONNECTED");
+      return null;
+    }
+
     if (!data.client_secret?.value) {
+      const message = getConnectionErrorMessage(data);
       logClientEvent(data, "error.no_ephemeral_key");
-      console.error("No ephemeral key provided by the server");
+      console.error(message);
+      setConnectionError(message);
       setSessionStatus("DISCONNECTED");
       return null;
     }
@@ -204,6 +229,7 @@ function App() {
     const agentSetKey = searchParams.get("agentConfig") || "default";
     if (sdkScenarioMap[agentSetKey]) {
       if (sessionStatus !== "DISCONNECTED") return;
+      setConnectionError(null);
       setSessionStatus("CONNECTING");
 
       try {
@@ -233,6 +259,7 @@ function App() {
         });
       } catch (err) {
         console.error("Error connecting via SDK:", err);
+        setConnectionError(getErrorMessage(err));
         setSessionStatus("DISCONNECTED");
       }
       return;
@@ -268,19 +295,14 @@ function App() {
     const turnDetection = isPTTActive
       ? null
       : {
-          type: 'server_vad',
+          type: 'server_vad' as const,
           threshold: 0.9,
           prefix_padding_ms: 300,
           silence_duration_ms: 500,
           create_response: true,
         };
 
-    sendEvent({
-      type: 'session.update',
-      session: {
-        turn_detection: turnDetection,
-      },
-    });
+    sendEvent(createRealtimeSessionUpdate(turnDetection));
 
     // Send an initial 'hi' message to trigger the agent to greet the user
     if (shouldTriggerResponse) {
@@ -532,6 +554,12 @@ function App() {
 
         <Events isExpanded={isEventsPaneExpanded} />
       </div>
+
+      {connectionError && (
+        <div className="mx-2 mt-2 rounded-md border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-800">
+          {connectionError}
+        </div>
+      )}
 
       <BottomToolbar
         sessionStatus={sessionStatus}

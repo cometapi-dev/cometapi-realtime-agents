@@ -2,6 +2,7 @@ import { useCallback, useRef, useState, useEffect } from "react";
 import { RealtimeAgent } from "@openai/agents/realtime";
 
 import { CometAPIWebSocket, RealtimeEvent } from "../lib/cometapiWebSocket";
+import { createRealtimeSessionUpdate } from "../lib/realtimeSessionConfig";
 import { useEvent } from "../contexts/EventContext";
 import { useHandleSessionHistory } from "./useHandleSessionHistory";
 import { SessionStatus } from "../types";
@@ -65,18 +66,15 @@ export function useRealtimeSession(callbacks: RealtimeSessionCallbacks = {}) {
             "[useRealtimeSession] Sending session.update to configure Server VAD..."
           );
           if (wsRef.current) {
-            wsRef.current.sendEvent({
-              type: "session.update",
-              session: {
-                turn_detection: {
-                  type: "server_vad",
-                  threshold: 0.5,
-                  prefix_padding_ms: 300,
-                  silence_duration_ms: 500,
-                  create_response: true,
-                },
-              },
-            });
+            wsRef.current.sendEvent(
+              createRealtimeSessionUpdate({
+                type: "server_vad",
+                threshold: 0.5,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 500,
+                create_response: true,
+              })
+            );
             console.log(
               "[useRealtimeSession] Server VAD configured - ready for voice input!"
             );
