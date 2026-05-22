@@ -39,6 +39,12 @@ const sdkScenarioMap: Record<string, RealtimeAgent[]> = {
 import useAudioDownload from "./hooks/useAudioDownload";
 import { useHandleSessionHistory } from "./hooks/useHandleSessionHistory";
 
+type SessionConfig = {
+  clientSecret: string;
+  model?: string;
+  endpoint?: string;
+};
+
 function App() {
   const searchParams = useSearchParams()!;
 
@@ -186,35 +192,43 @@ function App() {
   }, [isPTTActive]);
   */
 
-  const getConnectionErrorMessage = (data: any, status?: number) => {
-    const preflightMessage = data?.preflight?.message;
-    const preflightCode = data?.preflight?.code;
-    const serverMessage = data?.message || data?.error;
-    const prefix = status ? `Realtime preflight failed (${status})` : "Realtime connection failed";
-    const detail = preflightMessage || serverMessage || "No diagnostic message was returned.";
-    return preflightCode ? `${prefix}: ${detail} [${preflightCode}]` : `${prefix}: ${detail}`;
-  };
-
   const getErrorMessage = (err: unknown) => {
     return err instanceof Error ? err.message : String(err);
   };
 
-  const fetchEphemeralKey = async (): Promise<string | null> => {
+  const parseResponseBody = (rawText: string) => {
+    if (!rawText) return {};
+    try {
+      return JSON.parse(rawText);
+    } catch {
+      return {
+        type: "error",
+        message: rawText,
+      };
+    }
+  };
+
+  const getRawErrorMessage = (rawText: string, fallback: string) => {
+    return rawText.trim() || fallback;
+  };
+
+  const fetchSessionConfig = async (): Promise<SessionConfig | null> => {
     logClientEvent({ url: "/session" }, "fetch_session_token_request");
     const tokenResponse = await fetch("/api/session");
-    const data = await tokenResponse.json();
+    const rawText = await tokenResponse.text();
+    const data = parseResponseBody(rawText);
     logServerEvent(data, "fetch_session_token_response");
 
     if (!tokenResponse.ok) {
-      const message = getConnectionErrorMessage(data, tokenResponse.status);
+      const message = getRawErrorMessage(rawText, tokenResponse.statusText);
       setConnectionError(message);
-      logClientEvent({ type: "error", message, response: data }, "fetch_session_token_failed");
+      logClientEvent({ type: "error", message }, "fetch_session_token_failed");
       setSessionStatus("DISCONNECTED");
       return null;
     }
 
     if (!data.client_secret?.value) {
-      const message = getConnectionErrorMessage(data);
+      const message = rawText || "No client_secret.value returned.";
       logClientEvent(data, "error.no_ephemeral_key");
       console.error(message);
       setConnectionError(message);
@@ -222,7 +236,11 @@ function App() {
       return null;
     }
 
-    return data.client_secret.value;
+    return {
+      clientSecret: data.client_secret.value,
+      model: data.model,
+      endpoint: data.endpoint,
+    };
   };
 
   const connectToRealtime = async () => {
@@ -233,8 +251,8 @@ function App() {
       setSessionStatus("CONNECTING");
 
       try {
-        const EPHEMERAL_KEY = await fetchEphemeralKey();
-        if (!EPHEMERAL_KEY) return;
+        const sessionConfig = await fetchSessionConfig();
+        if (!sessionConfig) return;
 
         // Ensure the selectedAgentName is first so that it becomes the root
         const reorderedAgents = [...sdkScenarioMap[agentSetKey]];
@@ -250,7 +268,9 @@ function App() {
         const guardrail = createModerationGuardrail(companyName);
 
         await connect({
-          getEphemeralKey: async () => EPHEMERAL_KEY,
+          getEphemeralKey: async () => sessionConfig.clientSecret,
+          model: sessionConfig.model,
+          url: sessionConfig.endpoint,
           initialAgents: reorderedAgents,
           outputGuardrails: [guardrail],
           extraContext: {

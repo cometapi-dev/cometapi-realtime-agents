@@ -9,9 +9,9 @@
   },
   "private": true,
   "scripts": {
-    "dev": "dotenv -c -- next dev",
-    "build": "next build",
-    "start": "next start",
+    "dev": "dotenv -e .env --override -- next dev",
+    "build": "dotenv -e .env --override -- next build",
+    "start": "dotenv -e .env --override -- next start",
     "lint": "next lint"
   },
   "dependencies": {

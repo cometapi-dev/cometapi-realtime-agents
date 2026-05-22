@@ -1,4 +1,8 @@
 import { NextResponse } from "next/server";
+import { existsSync, readFileSync } from "fs";
+import { join } from "path";
+import { parse } from "dotenv";
+import NodeWebSocket from "ws";
 import { createRealtimeSessionUpdate } from "../../lib/realtimeSessionConfig";
 
 export const runtime = "nodejs";
@@ -8,6 +12,10 @@ type RealtimePreflightResult = {
   model: string;
   endpoint: string;
   opened: boolean;
+  rawText?: string;
+  contentType?: string;
+  statusCode?: number;
+  statusMessage?: string;
   code?: string;
   message?: string;
   requestId?: string;
@@ -20,6 +28,28 @@ type RealtimePreflightResult = {
 };
 
 const PREFLIGHT_TIMEOUT_MS = 4500;
+const DEFAULT_REALTIME_URL = "wss://api.cometapi.com/v1/realtime";
+
+function loadEnvFile() {
+  const envPath = join(process.cwd(), ".env");
+  if (!existsSync(envPath)) {
+    return {};
+  }
+  return parse(readFileSync(envPath));
+}
+
+function getRuntimeConfig() {
+  const fileEnv = loadEnvFile();
+  const getValue = (key: string, fallback?: string) =>
+    fileEnv[key] ?? process.env[key] ?? fallback;
+
+  return {
+    apiKey: getValue("COMETAPI_KEY"),
+    model: getValue("COMETAPI_MODEL", "gpt-4o-realtime-preview-2025-06-03")!,
+    realtimeUrl: getValue("COMETAPI_REALTIME_URL", DEFAULT_REALTIME_URL)!,
+    keySource: fileEnv.COMETAPI_KEY ? ".env" : "process.env",
+  };
+}
 
 function parseRealtimeMessage(data: unknown): any {
   if (typeof data !== "string") return null;
@@ -50,14 +80,14 @@ async function preflightRealtimeSession(
     const endpoint = `${realtimeUrl}?model=${encodeURIComponent(model)}`;
     let opened = false;
     let isSettled = false;
-    let ws: WebSocket | null = null;
+    let ws: NodeWebSocket | null = null;
 
     const finish = (result: Omit<RealtimePreflightResult, "model" | "endpoint" | "opened">) => {
       if (isSettled) return;
       isSettled = true;
       clearTimeout(timeout);
-      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-        ws.close();
+      if (ws && (ws.readyState === NodeWebSocket.OPEN || ws.readyState === NodeWebSocket.CONNECTING)) {
+        ws.terminate();
       }
       resolve({
         model,
@@ -74,17 +104,20 @@ async function preflightRealtimeSession(
         message: opened
           ? "Realtime WebSocket opened but did not return a session or error event before the preflight timeout."
           : "Realtime WebSocket did not open before the preflight timeout.",
+        rawText: opened
+          ? "Realtime WebSocket opened but did not return a session or error event before the preflight timeout."
+          : "Realtime WebSocket did not open before the preflight timeout.",
         warning: opened ? "Proceeding because the socket opened and no server error was observed." : undefined,
       });
     }, PREFLIGHT_TIMEOUT_MS);
 
     try {
-      ws = new WebSocket(endpoint, [
+      ws = new NodeWebSocket(endpoint, [
         "realtime",
         `openai-insecure-api-key.${apiKey}`,
       ]);
 
-      ws.addEventListener("open", () => {
+      ws.on("open", () => {
         opened = true;
         ws?.send(
           JSON.stringify(
@@ -99,8 +132,9 @@ async function preflightRealtimeSession(
         );
       });
 
-      ws.addEventListener("message", (event) => {
-        const message = parseRealtimeMessage(event.data);
+      ws.on("message", (data) => {
+        const rawText = data.toString();
+        const message = parseRealtimeMessage(rawText);
         if (!message) return;
 
         if (message.type === "error") {
@@ -109,6 +143,8 @@ async function preflightRealtimeSession(
             code: message.error?.code || message.error?.type || "realtime_error",
             message: getRealtimeErrorMessage(message),
             requestId: message.event_id || message.error?.event_id,
+            rawText,
+            contentType: "application/json; charset=utf-8",
           });
           return;
         }
@@ -122,26 +158,50 @@ async function preflightRealtimeSession(
         }
       });
 
-      ws.addEventListener("close", (event) => {
+      ws.on("unexpected-response", (_request, response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk) => {
+          chunks.push(Buffer.from(chunk));
+        });
+        response.on("end", () => {
+          const rawText = Buffer.concat(chunks).toString("utf8");
+          finish({
+            ok: false,
+            statusCode: response.statusCode,
+            statusMessage: response.statusMessage,
+            requestId: response.headers["x-cometapi-request-id"] as string | undefined,
+            contentType: response.headers["content-type"] as string | undefined,
+            rawText: rawText || response.statusMessage || "WebSocket handshake failed.",
+            message: rawText || response.statusMessage || "WebSocket handshake failed.",
+          });
+        });
+      });
+
+      ws.on("close", (code, reason) => {
+        const rawText = reason.toString();
         finish({
           ok: false,
           code: "websocket_closed",
           message:
-            event.reason ||
-            `Realtime WebSocket closed before a session event was received (code ${event.code}).`,
+            rawText ||
+            `Realtime WebSocket closed before a session event was received (code ${code}).`,
+          rawText:
+            rawText ||
+            `Realtime WebSocket closed before a session event was received (code ${code}).`,
           close: {
-            code: event.code,
-            reason: event.reason,
-            wasClean: event.wasClean,
+            code,
+            reason: rawText,
+            wasClean: code === 1000,
           },
         });
       });
 
-      ws.addEventListener("error", () => {
+      ws.on("error", (error) => {
         finish({
           ok: false,
           code: "websocket_error",
-          message: "Realtime WebSocket failed during preflight.",
+          message: error.message || "Realtime WebSocket failed during preflight.",
+          rawText: error.message || "Realtime WebSocket failed during preflight.",
         });
       });
     } catch (error) {
@@ -149,8 +209,19 @@ async function preflightRealtimeSession(
         ok: false,
         code: "preflight_exception",
         message: error instanceof Error ? error.message : String(error),
+        rawText: error instanceof Error ? error.message : String(error),
       });
     }
+  });
+}
+
+function rawFailureResponse(preflight: RealtimePreflightResult) {
+  return new NextResponse(preflight.rawText || preflight.message || "", {
+    status: preflight.statusCode && preflight.statusCode >= 400 ? preflight.statusCode : 502,
+    headers: {
+      "Content-Type": preflight.contentType || "text/plain; charset=utf-8",
+      ...(preflight.requestId ? { "X-CometAPI-Request-ID": preflight.requestId } : {}),
+    },
   });
 }
 
@@ -171,11 +242,7 @@ async function preflightRealtimeSession(
 export async function GET() {
   try {
     // Get CometAPI configuration from environment
-    const apiKey = process.env.COMETAPI_KEY;
-    const model =
-      process.env.COMETAPI_MODEL || "gpt-4o-realtime-preview-2025-06-03";
-    const realtimeUrl =
-      process.env.COMETAPI_REALTIME_URL || "wss://api.cometapi.com/v1/realtime";
+    const { apiKey, model, realtimeUrl, keySource } = getRuntimeConfig();
 
     if (!apiKey) {
       return NextResponse.json(
@@ -191,16 +258,13 @@ export async function GET() {
     console.log(
       "[session] Using direct API key authentication (CometAPI does not yet support /v1/realtime/sessions)"
     );
-    console.log("[session] Using model:", model);
-    console.log(
-      "[session] API Key (first 10 chars):",
-      apiKey.substring(0, 10) + "..."
-    );
-    console.log(
-      '[session] API Key format - starts with "sk-":',
-      apiKey.startsWith("sk-")
-    );
-    console.log("[session] API Key length:", apiKey.length);
+    console.log("[session] Runtime config:", {
+      model,
+      realtimeUrl,
+      keySource,
+      keyPrefix: `${apiKey.slice(0, 6)}...`,
+      keyLength: apiKey.length,
+    });
 
     // KNOWN ISSUE: CometAPI Realtime API server currently validates API keys against OpenAI's format
     // and rejects valid CometAPI keys with error: "invalid_api_key"
@@ -217,16 +281,7 @@ export async function GET() {
         "[session] Realtime preflight failed:",
         JSON.stringify(preflight, null, 2)
       );
-      return NextResponse.json(
-        {
-          error: "Realtime preflight failed",
-          message: preflight.message,
-          model,
-          endpoint: realtimeUrl,
-          preflight,
-        },
-        { status: 502 }
-      );
+      return rawFailureResponse(preflight);
     }
 
     // Return a mock session response with the API key as the ephemeral token
@@ -236,6 +291,7 @@ export async function GET() {
       object: "realtime.session",
       type: "realtime",
       model: model,
+      endpoint: realtimeUrl,
       output_modalities: ["audio"],
       instructions: "",
       audio: {

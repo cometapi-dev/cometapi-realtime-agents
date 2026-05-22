@@ -29,6 +29,8 @@ export interface RealtimeSessionCallbacks {
 
 export interface ConnectOptions {
   getEphemeralKey: () => Promise<string>;
+  model?: string;
+  url?: string;
   initialAgents: RealtimeAgent[];
   extraContext?: Record<string, any>;
   outputGuardrails?: any[];
@@ -205,6 +207,8 @@ export function useRealtimeSession(callbacks: RealtimeSessionCallbacks = {}) {
   const connect = useCallback(
     async ({
       getEphemeralKey,
+      model,
+      url,
       initialAgents,
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       extraContext: _extraContext,
@@ -243,11 +247,8 @@ export function useRealtimeSession(callbacks: RealtimeSessionCallbacks = {}) {
         // Create native WebSocket connection
         const ws = new CometAPIWebSocket({
           apiKey,
-          model:
-            process.env.COMETAPI_MODEL || "gpt-4o-realtime-preview-2025-06-03",
-          url:
-            process.env.COMETAPI_REALTIME_URL ||
-            "wss://api.cometapi.com/v1/realtime",
+          model: model || "gpt-4o-realtime-preview-2025-06-03",
+          url: url || "wss://api.cometapi.com/v1/realtime",
         });
 
         // Pre-set the audio context and stream
@@ -262,12 +263,11 @@ export function useRealtimeSession(callbacks: RealtimeSessionCallbacks = {}) {
         );
         console.log(
           "[useRealtimeSession] Endpoint:",
-          process.env.COMETAPI_REALTIME_URL ||
-            "wss://api.cometapi.com/v1/realtime"
+          url || "wss://api.cometapi.com/v1/realtime"
         );
         console.log(
           "[useRealtimeSession] Model:",
-          process.env.COMETAPI_MODEL || "gpt-4o-realtime-preview-2025-06-03"
+          model || "gpt-4o-realtime-preview-2025-06-03"
         );
         console.log(
           '[useRealtimeSession] API Key format check - starts with "sk-":',
